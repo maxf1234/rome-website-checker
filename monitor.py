@@ -168,6 +168,10 @@ def main() -> None:
             data = fetch_calendar_month(page_id)
         except HTTPError as e:
             print(f"  [{name}] HTTPError: {e.code} {e.reason}")
+            try:
+                print(f"    Body: {e.read().decode('utf-8', errors='replace')[:2000]}")
+            except Exception:
+                pass
             continue
         except URLError as e:
             print(f"  [{name}] URLError: {e}")
