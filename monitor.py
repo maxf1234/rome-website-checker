@@ -61,6 +61,7 @@ def fetch_calendar_month(page_id: str) -> dict:
     proxy_url = (
         f"http://api.scraperapi.com/?api_key={SCRAPER_API_KEY}"
         f"&url={quote(CALENDAR_URL, safe='')}"
+        f"&premium=true"
     )
     req = Request(
         proxy_url,
