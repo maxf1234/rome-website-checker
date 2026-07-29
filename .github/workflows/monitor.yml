@@ -9,7 +9,7 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     permissions:
       contents: write
@@ -18,18 +18,12 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
       - name: Run monitor
         env:
-          SCRAPER_API_KEY:  ${{ secrets.SCRAPER_API_KEY }}
           EMAIL_SENDER:     ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD:   ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECIPIENT:  ${{ secrets.EMAIL_RECIPIENT }}
-        run: python monitor.py
+        run: python3 monitor.py
 
       - name: Commit updated state
         run: |
