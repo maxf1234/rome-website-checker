@@ -127,7 +127,64 @@ def date_variants_for(date_str: str) -> list[str]:
     ]
 
 
+def test_calendar_endpoint() -> None:
+    """One-off test: replay the captured browser request against the real
+    calendar AJAX endpoint to see whether Octofence blocks it purely by IP
+    (in which case these cookies won't matter) or needs a valid session."""
+    from urllib.request import urlopen, Request
+    from urllib.error import HTTPError, URLError
+
+    url = "https://ticketing.colosseo.it/mtajax/calendars_month"
+    body = "action=midaabc_calendars_month&page=225&year=2026&month=8".encode("utf-8")
+    headers = {
+        "accept": "*/*",
+        "accept-language": "en-US,en;q=0.9",
+        "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "cookie": (
+            "PHPSESSID=ee8f1f103705ce81f5ee1817a2753ea2; "
+            "octofence_jslc=2ffd1556fbcf1322b04f01eb910523307c7b5aa1002ebb68dcc0055b758dfd30; "
+            "_of0c681e746413a788=ejBucks1XiQESHARCx9jLS40anIYYgh3AxxxRQ1MPCs; "
+            "cookielawinfo-checkbox-necessary=yes; cookielawinfo-checkbox-non-necessary=yes; "
+            "_ga=GA1.1.699914594.1785359999; "
+            "_ga_M4S0PL1M7R=GS2.1.s1785359998$o1$g0$t1785359998$j60$l0$h0; "
+            "qtrans_front_language=en"
+        ),
+        "origin": "https://ticketing.colosseo.it",
+        "referer": "https://ticketing.colosseo.it/en/eventi/full-experience-sotterranei-e-arena/",
+        "sec-ch-ua": '"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"macOS"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "user-agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+        ),
+        "x-requested-with": "XMLHttpRequest",
+    }
+    print("### TEST: replaying captured browser session against calendars_month ###")
+    req = Request(url, data=body, headers=headers, method="POST")
+    try:
+        with urlopen(req, timeout=20) as resp:
+            text = resp.read().decode("utf-8", errors="replace")
+            print(f"  Status: {resp.status}")
+            print(f"  Length: {len(text)}")
+            print(f"  Body (first 3000 chars): {text[:3000]}")
+    except HTTPError as e:
+        print(f"  HTTPError: {e.code} {e.reason}")
+        try:
+            body_text = e.read().decode("utf-8", errors="replace")
+            print(f"  Body (first 1000 chars): {body_text[:1000]}")
+        except Exception:
+            pass
+    except URLError as e:
+        print(f"  URLError: {e}")
+    print()
+
+
 def main() -> None:
+    test_calendar_endpoint()
     print(f"[{datetime.now().isoformat()}] Discovery run — target date {TARGET_DATE}\n")
     variants = date_variants_for(TARGET_DATE)
 
