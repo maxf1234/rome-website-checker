@@ -50,6 +50,12 @@ HEADERS = {
 DIAG_URLS = [
     "https://ticketing.colosseo.it/",
     "https://www.colosseo.it/en/",
+    "https://ticketing.colosseo.it/api/",
+    "https://ticketing.colosseo.it/wp-json/",
+    "https://api.ticketing.colosseo.it/",
+    "https://api.colosseo.it/",
+    "https://booking.colosseo.it/",
+    "https://www.coopculture.it/en/colosseo-e-shop.cfm",
 ]
 
 KEYWORDS = [
