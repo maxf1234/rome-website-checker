@@ -4,8 +4,9 @@ Colosseum Ticketing Monitor
 Checks the MidaTicket calendar AJAX endpoint behind ticketing.colosseo.it for
 August 7 availability on two Full Experience event pages, and emails a list
 of recipients as soon as any slot opens up. The site's Octofence WAAP blocks
-requests from datacenter IPs outright, so calls are routed through ScraperAPI
-(residential IP pool) instead of hitting the site directly.
+requests from datacenter/cloud IPs outright, so this runs on a self-hosted
+GitHub Actions runner (your own machine's residential IP) rather than
+GitHub-hosted runners.
 """
 
 import json
@@ -14,7 +15,6 @@ import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from urllib.parse import quote
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
@@ -41,35 +41,40 @@ TARGET_MONTH = 8
 
 STATE_FILE = "state.json"
 
-SCRAPER_API_KEY = os.environ["SCRAPER_API_KEY"]
 EMAIL_SENDER    = os.environ["EMAIL_SENDER"]
 EMAIL_PASSWORD  = os.environ["EMAIL_PASSWORD"]
 EMAIL_RECIPIENT = os.environ["EMAIL_RECIPIENT"]
 RECIPIENT_LIST  = [e.strip() for e in EMAIL_RECIPIENT.split(",") if e.strip()]
 
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+    "Origin": "https://ticketing.colosseo.it",
+    "X-Requested-With": "XMLHttpRequest",
+}
+
 # ─────────────────────────────────────────────
 
 
-def fetch_calendar_month(page_id: str) -> dict:
-    """POST to the calendars_month AJAX endpoint via ScraperAPI (residential
-    IP pool), since the site blocks datacenter IPs outright at the firewall."""
+def fetch_calendar_month(page_id: str, page_url: str) -> dict:
+    """POST to the calendars_month AJAX endpoint directly. Requires running
+    on a residential IP (self-hosted runner) — the site's Octofence WAAP
+    blocks datacenter/cloud IPs outright before this ever reaches the app."""
     body = (
         f"action=midaabc_calendars_month&page={page_id}"
         f"&year={TARGET_YEAR}&month={TARGET_MONTH}"
     ).encode("utf-8")
 
-    proxy_url = (
-        f"http://api.scraperapi.com/?api_key={SCRAPER_API_KEY}"
-        f"&url={quote(CALENDAR_URL, safe='')}"
-        f"&premium=true"
-    )
-    req = Request(
-        proxy_url,
-        data=body,
-        headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
-        method="POST",
-    )
-    with urlopen(req, timeout=90) as resp:
+    headers = dict(HEADERS)
+    headers["Referer"] = page_url
+
+    req = Request(CALENDAR_URL, data=body, headers=headers, method="POST")
+    with urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -166,7 +171,7 @@ def main() -> None:
             continue
 
         try:
-            data = fetch_calendar_month(page_id)
+            data = fetch_calendar_month(page_id, cfg["page_url"])
         except HTTPError as e:
             print(f"  [{name}] HTTPError: {e.code} {e.reason}")
             try:
