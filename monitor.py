@@ -33,9 +33,24 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9,it;q=0.8",
+    "Accept-Encoding": "identity",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Upgrade-Insecure-Requests": "1",
+    "Referer": "https://www.colosseo.it/",
 }
+
+DIAG_URLS = [
+    "https://ticketing.colosseo.it/",
+    "https://www.colosseo.it/en/",
+]
 
 KEYWORDS = [
     "sold out", "sold-out", "not available", "no availability", "waiting list",
@@ -109,6 +124,19 @@ def date_variants_for(date_str: str) -> list[str]:
 def main() -> None:
     print(f"[{datetime.now().isoformat()}] Discovery run — target date {TARGET_DATE}\n")
     variants = date_variants_for(TARGET_DATE)
+
+    print("### DIAGNOSTIC: checking whether the block is domain-wide / IP-based ###")
+    for url in DIAG_URLS:
+        print(f"  Trying: {url}")
+        try:
+            status, html = fetch(url)
+            print(f"    Status: {status}, length: {len(html)}, title: {get_title(html)}")
+            print(f"    Blocked page?: {looks_like_challenge(html) or 'you have been blocked' in html.lower()}")
+        except HTTPError as e:
+            print(f"    HTTPError: {e.code} {e.reason}")
+        except Exception as e:
+            print(f"    Error: {e}")
+    print()
 
     for name, url in EVENTS.items():
         print("=" * 70)
