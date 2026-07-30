@@ -15,7 +15,7 @@ import smtplib
 from datetime import datetime
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from urllib.request import urlopen, Request
+from urllib.request import Request, ProxyHandler, build_opener
 from urllib.error import URLError, HTTPError
 
 # ─────────────────────────────────────────────
@@ -46,6 +46,12 @@ EMAIL_PASSWORD  = os.environ["EMAIL_PASSWORD"]
 EMAIL_RECIPIENT = os.environ["EMAIL_RECIPIENT"]
 RECIPIENT_LIST  = [e.strip() for e in EMAIL_RECIPIENT.split(",") if e.strip()]
 
+# Residential proxy, e.g. "http://user:pass@geo.example.com:12321".
+# Required when running on GitHub-hosted runners — the site's firewall blocks
+# datacenter IPs. Leave unset to connect directly (self-hosted runner on a
+# residential connection).
+PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -61,10 +67,17 @@ HEADERS = {
 # ─────────────────────────────────────────────
 
 
+def build_http_opener():
+    """Route requests through the residential proxy if one is configured."""
+    if PROXY_URL:
+        return build_opener(ProxyHandler({"http": PROXY_URL, "https": PROXY_URL}))
+    return build_opener()
+
+
 def fetch_calendar_month(page_id: str, page_url: str) -> dict:
-    """POST to the calendars_month AJAX endpoint directly. Requires running
-    on a residential IP (self-hosted runner) — the site's Octofence WAAP
-    blocks datacenter/cloud IPs outright before this ever reaches the app."""
+    """POST to the calendars_month AJAX endpoint. Must originate from a
+    residential IP — the site's Octofence WAAP blocks datacenter/cloud IPs
+    outright before the request ever reaches the application."""
     body = (
         f"action=midaabc_calendars_month&page={page_id}"
         f"&year={TARGET_YEAR}&month={TARGET_MONTH}"
@@ -74,7 +87,8 @@ def fetch_calendar_month(page_id: str, page_url: str) -> dict:
     headers["Referer"] = page_url
 
     req = Request(CALENDAR_URL, data=body, headers=headers, method="POST")
-    with urlopen(req, timeout=30) as resp:
+    opener = build_http_opener()
+    with opener.open(req, timeout=60) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -158,6 +172,11 @@ def send_email(changes: list, current_by_event: dict) -> None:
 
 def main() -> None:
     print(f"[{datetime.now().isoformat()}] Checking Aug 7 availability...")
+    if PROXY_URL:
+        # Never print the URL itself — it embeds proxy credentials.
+        print(f"  Routing through proxy host: {PROXY_URL.split('@')[-1]}")
+    else:
+        print("  No proxy configured — connecting directly.")
 
     state = load_state()
     previous = state.get("events", {})
