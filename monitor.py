@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
-Acuity Scheduling Availability Monitor — DISCOVERY MODE v4
+Acuity Scheduling Availability Monitor — DISCOVERY MODE v5
 
-v3 found the API base `/api/scheduling/v1` and that the SPA calls
-`availability.month.get` / `availability.times.get` from an endpoint
-registry. This pass extracts the exact URL templates from the bundle and
-probes the most likely availability endpoints.
+v4 confirmed `/api/scheduling/v1/availability/month` is the right endpoint
+(401 Unauthorized, not 404). This pass works out the auth: first tries
+carrying session cookies from loading the booking page, then greps the
+bundle for whatever header/token the SPA attaches.
 """
 
+import http.cookiejar
 import re
 from datetime import datetime
-from urllib.request import urlopen, Request
+from urllib.request import Request, build_opener, HTTPCookieProcessor
 from urllib.error import HTTPError
 
 BOOKING_URL = (
@@ -26,33 +27,47 @@ MONTH               = "2026-08"
 
 BASE = "https://app.acuityscheduling.com/api/scheduling/v1"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-    ),
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+
+PAGE_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+API_HEADERS = {
+    "User-Agent": UA,
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": BOOKING_URL,
     "X-Requested-With": "XMLHttpRequest",
 }
 
+jar = http.cookiejar.CookieJar()
+opener = build_opener(HTTPCookieProcessor(jar))
+
 
 def get(url: str, headers: dict, timeout: int = 60) -> tuple[int, str]:
     req = Request(url, headers=headers, method="GET")
-    with urlopen(req, timeout=timeout) as resp:
+    with opener.open(req, timeout=timeout) as resp:
         return resp.status, resp.read().decode("utf-8", errors="replace")
 
 
-def probe(label: str, url: str) -> None:
+def probe(label: str, url: str, extra_headers: dict | None = None) -> None:
+    h = dict(API_HEADERS)
+    if extra_headers:
+        h.update(extra_headers)
     print(f"\n  PROBE [{label}]")
     print(f"    {url}")
+    if extra_headers:
+        print(f"    extra headers: {list(extra_headers.keys())}")
     try:
-        status, text = get(url, HEADERS)
+        status, text = get(url, h)
     except HTTPError as e:
         body = ""
         try:
-            body = e.read().decode("utf-8", errors="replace")[:400]
+            body = e.read().decode("utf-8", errors="replace")[:300]
         except Exception:
             pass
         print(f"    HTTP {e.code} {e.reason} :: {body}")
@@ -61,59 +76,72 @@ def probe(label: str, url: str) -> None:
         print(f"    Error: {e}")
         return
     print(f"    HTTP {status}, {len(text)} chars")
-    print(f"    Body: {text[:2000]}")
+    print(f"    Body: {text[:2500]}")
 
 
 def main() -> None:
-    print(f"[{datetime.now().isoformat()}] Acuity discovery v4")
+    print(f"[{datetime.now().isoformat()}] Acuity discovery v5 — auth")
 
-    # ── 1. Find the endpoint registry in the bundle ──
+    # ── 1. Load booking page to establish a session ──
+    print("\n### STEP 1: load page for cookies ###")
+    html = ""
     try:
-        _, html = get(BOOKING_URL, HEADERS)
+        status, html = get(BOOKING_URL, PAGE_HEADERS)
+        print(f"  page HTTP {status}, {len(html)} chars")
     except Exception as e:
-        print(f"  page load failed: {e}")
-        html = ""
+        print(f"  page load error: {e}")
 
-    scripts = [s for s in re.findall(r'<script[^>]*src=["\']?([^"\'\s>]+)', html, re.I)
-               if s.endswith(".js") and "recaptcha" not in s]
+    print(f"  Cookies obtained ({len(jar)}):")
+    for c in jar:
+        val = c.value or ""
+        print(f"    {c.name} = {val[:40]}{'...' if len(val) > 40 else ''}  (domain={c.domain})")
 
-    for src in scripts:
-        url = src if src.startswith("http") else f"https://app.acuityscheduling.com{src}"
-        if "scheduling-pylon" not in url:
-            continue
-        print(f"\n### Bundle: {url}")
-        try:
-            _, js = get(url, HEADERS)
-        except Exception as e:
-            print(f"    error: {e}")
-            continue
-        print(f"    {len(js)} chars")
+    # Any token embedded directly in the page?
+    for pat in [r'["\']?(?:csrf|token|apiKey|api_key|authToken)["\']?\s*[:=]\s*["\']([A-Za-z0-9._\-]{16,})["\']',
+                r'window\.__[A-Z_]+__\s*=\s*(\{.{0,600})']:
+        for m in list(re.finditer(pat, html, re.I))[:5]:
+            print(f"  page token candidate: {m.group(0)[:200]}")
 
-        # The endpoint registry: look for `availability:{` and nearby definitions
-        for pat in [r"availability\s*:\s*\{", r"month\s*:\s*\{\s*get", r"times\s*:\s*\{\s*get"]:
-            for m in list(re.finditer(pat, js))[:4]:
-                a, b = max(0, m.start() - 400), min(len(js), m.end() + 1600)
-                print(f"\n    [{pat}] ...{js[a:b]}...")
-
-        # How is the API base used?
-        for m in list(re.finditer(re.escape("/api/scheduling/v1"), js))[:5]:
-            a, b = max(0, m.start() - 500), min(len(js), m.end() + 500)
-            print(f"\n    [base usage] ...{js[a:b]}...")
-
-    # ── 2. Probe likely availability endpoints ──
-    print("\n\n### Probing candidate availability endpoints ###")
-    qs_variants = [
+    # ── 2. Retry the availability endpoint WITH session cookies ──
+    print("\n\n### STEP 2: availability/month with session cookies ###")
+    param_sets = [
         f"appointmentTypeID={APPOINTMENT_TYPE_ID}&calendarID={CALENDAR_ID}&month={MONTH}",
         f"appointmentTypeId={APPOINTMENT_TYPE_ID}&calendarId={CALENDAR_ID}&month={MONTH}",
         f"owner={OWNER_ID}&appointmentTypeID={APPOINTMENT_TYPE_ID}&calendarID={CALENDAR_ID}&month={MONTH}",
         f"ownerKey={SLUG}&appointmentTypeID={APPOINTMENT_TYPE_ID}&calendarID={CALENDAR_ID}&month={MONTH}",
     ]
-    for i, qs in enumerate(qs_variants):
-        probe(f"availability/dates v{i}", f"{BASE}/availability/dates?{qs}")
-        probe(f"availability/month v{i}", f"{BASE}/availability/month?{qs}")
+    for i, qs in enumerate(param_sets):
+        probe(f"month params#{i}", f"{BASE}/availability/month?{qs}")
 
-    probe("catalog", f"{BASE}/catalog/{SLUG}")
-    probe("schedule root", f"{BASE}/schedule/{SLUG}")
+    # Some Squarespace Scheduling deployments key off an owner header
+    probe("month + X-Secondo-Owner", f"{BASE}/availability/month?{param_sets[0]}",
+          {"X-Secondo-Owner": OWNER_ID})
+    probe("month + owner-key header", f"{BASE}/availability/month?{param_sets[0]}",
+          {"X-Owner-Key": SLUG})
+
+    # ── 3. Grep bundle for auth mechanics ──
+    print("\n\n### STEP 3: bundle auth grep ###")
+    scripts = [s for s in re.findall(r'<script[^>]*src=["\']?([^"\'\s>]+)', html, re.I)
+               if s.endswith(".js") and "scheduling-pylon" in s and "errorReporter" not in s]
+    for src in scripts:
+        url = src if src.startswith("http") else f"https://app.acuityscheduling.com{src}"
+        print(f"\n  Bundle: {url}")
+        try:
+            _, js = get(url, PAGE_HEADERS)
+        except Exception as e:
+            print(f"    error: {e}")
+            continue
+        print(f"    {len(js)} chars")
+
+        for kw in ["Authorization", "Bearer", "X-Secondo", "authToken",
+                   "availability/month", "ownerKey:", "X-CSRF"]:
+            hits = list(re.finditer(re.escape(kw), js))[:3]
+            if not hits:
+                continue
+            print(f"    --- {kw} ({len(hits)} shown) ---")
+            for m in hits:
+                a, b = max(0, m.start() - 350), min(len(js), m.end() + 350)
+                print(f"      ...{js[a:b]}...")
 
 
 if __name__ == "__main__":
