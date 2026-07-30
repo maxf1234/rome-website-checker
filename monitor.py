@@ -80,16 +80,21 @@ HEADERS = {
 
 
 def months_to_check() -> list[str]:
-    """Current month plus the next MONTHS_AHEAD, as YYYY-MM."""
+    """Current month plus the next MONTHS_AHEAD.
+
+    The API wants a full YYYY-MM-DD date, not YYYY-MM (it rejects the short
+    form outright), and refuses dates before the current month — so the
+    current month is represented by today rather than the 1st.
+    """
     today = date.today()
-    out = []
+    out = [today.isoformat()]
     y, m = today.year, today.month
-    for _ in range(MONTHS_AHEAD + 1):
-        out.append(f"{y:04d}-{m:02d}")
+    for _ in range(MONTHS_AHEAD):
         m += 1
         if m > 12:
             m = 1
             y += 1
+        out.append(f"{y:04d}-{m:02d}-01")
     return out
 
 
@@ -214,7 +219,7 @@ def main() -> None:
             found[month] = dates
             print(f"  [{month}] *** {len(dates)} available: {dates} ***")
         else:
-            print(f"  [{month}] none")
+            print(f"  [{month}] none  (raw: {json.dumps(payload)[:200]})")
 
     if errors and not found:
         print(f"  WARNING: {errors} request(s) failed and nothing found — "
