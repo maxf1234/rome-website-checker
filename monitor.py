@@ -1,240 +1,178 @@
 #!/usr/bin/env python3
 """
-Colosseum Ticketing Monitor
-Checks the MidaTicket calendar AJAX endpoint behind ticketing.colosseo.it for
-August 7 availability on two Full Experience event pages, and emails a list
-of recipients as soon as any slot opens up. The site's Octofence WAAP blocks
-requests from datacenter/cloud IPs outright, so this runs on a self-hosted
-GitHub Actions runner (your own machine's residential IP) rather than
-GitHub-hosted runners.
+Acuity Scheduling Availability Monitor — DISCOVERY MODE
+
+Probes the target Acuity booking page to learn how it exposes availability
+before the real monitoring logic is written. Dumps page structure, embedded
+JSON/config, and the results of probing Acuity's known availability API
+endpoint shapes.
+
+Run this via the GitHub Action once, read the job logs, then replace this
+with the real check.
 """
 
 import json
-import os
-import smtplib
+import re
 from datetime import datetime
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from urllib.request import Request, ProxyHandler, build_opener
+from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
-# ─────────────────────────────────────────────
-#  CONFIGURATION
-# ─────────────────────────────────────────────
+BOOKING_URL = (
+    "https://app.acuityscheduling.com/schedule/ce551904"
+    "/appointment/71567018/calendar/11158185"
+)
 
-CALENDAR_URL = "https://ticketing.colosseo.it/mtajax/calendars_month"
+SLUG                = "ce551904"
+APPOINTMENT_TYPE_ID = "71567018"
+CALENDAR_ID         = "11158185"
 
-EVENTS = {
-    "Full Experience - Sotterranei e Arena": {
-        "page_id": "225",
-        "page_url": "https://ticketing.colosseo.it/en/eventi/full-experience-sotterranei-e-arena/",
-    },
-    "Full Experience - Percorso Didattico": {
-        "page_id": "753",
-        "page_url": "https://ticketing.colosseo.it/en/eventi/full-experience-sotterranei-e-arena-percorso-didattico/",
-    },
-}
-
-TARGET_DATE = "2026-08-07"
-TARGET_YEAR = 2026
-TARGET_MONTH = 8
-
-STATE_FILE = "state.json"
-
-EMAIL_SENDER    = os.environ["EMAIL_SENDER"]
-EMAIL_PASSWORD  = os.environ["EMAIL_PASSWORD"]
-EMAIL_RECIPIENT = os.environ["EMAIL_RECIPIENT"]
-RECIPIENT_LIST  = [e.strip() for e in EMAIL_RECIPIENT.split(",") if e.strip()]
-
-# Residential proxy, e.g. "http://user:pass@geo.example.com:12321".
-# Required when running on GitHub-hosted runners — the site's firewall blocks
-# datacenter IPs. Leave unset to connect directly (self-hosted runner on a
-# residential connection).
-PROXY_URL = os.environ.get("PROXY_URL", "").strip()
+MONTHS = ["2026-07", "2026-08", "2026-09"]
 
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "*/*",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-    "Origin": "https://ticketing.colosseo.it",
-    "X-Requested-With": "XMLHttpRequest",
 }
 
-# ─────────────────────────────────────────────
+JSON_HEADERS = dict(HEADERS)
+JSON_HEADERS["Accept"] = "application/json, text/plain, */*"
+JSON_HEADERS["X-Requested-With"] = "XMLHttpRequest"
+JSON_HEADERS["Referer"] = BOOKING_URL
+
+# Interesting keys that would indicate availability data
+AVAILABILITY_HINTS = [
+    "availableDates", "available", "slots", "times", "openings",
+    "soldOut", "isAvailable", "noTimes", "calendarID", "appointmentTypeID",
+    "owner", "firstAvailable",
+]
 
 
-def build_http_opener():
-    """Route requests through the residential proxy if one is configured."""
-    if PROXY_URL:
-        return build_opener(ProxyHandler({"http": PROXY_URL, "https": PROXY_URL}))
-    return build_opener()
+def fetch(url: str, headers: dict, timeout: int = 30) -> tuple[int, str]:
+    req = Request(url, headers=headers, method="GET")
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.status, resp.read().decode("utf-8", errors="replace")
 
 
-def fetch_calendar_month(page_id: str, page_url: str) -> dict:
-    """POST to the calendars_month AJAX endpoint. Must originate from a
-    residential IP — the site's Octofence WAAP blocks datacenter/cloud IPs
-    outright before the request ever reaches the application."""
-    body = (
-        f"action=midaabc_calendars_month&page={page_id}"
-        f"&year={TARGET_YEAR}&month={TARGET_MONTH}"
-    ).encode("utf-8")
+def probe(label: str, url: str, headers: dict) -> None:
+    print(f"  PROBE [{label}]")
+    print(f"    URL: {url}")
+    try:
+        status, text = fetch(url, headers)
+    except HTTPError as e:
+        print(f"    HTTPError {e.code} {e.reason}")
+        try:
+            print(f"    Body: {e.read().decode('utf-8', errors='replace')[:600]}")
+        except Exception:
+            pass
+        return
+    except URLError as e:
+        print(f"    URLError: {e}")
+        return
+    except Exception as e:
+        print(f"    Error: {e}")
+        return
 
-    headers = dict(HEADERS)
-    headers["Referer"] = page_url
-
-    req = Request(CALENDAR_URL, data=body, headers=headers, method="POST")
-    opener = build_http_opener()
-    with opener.open(req, timeout=60) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def slots_for_target_date(calendar_data: dict) -> list:
-    slots = calendar_data.get("data", [])
-    return [s for s in slots if s.get("startDateTime", "").startswith(TARGET_DATE)]
-
-
-def summarize(slots: list) -> dict:
-    total_available = sum(max(s.get("capacity", 0), 0) for s in slots)
-    available_slots = [s for s in slots if s.get("capacity", 0) > 0]
-    return {
-        "total_available_capacity": total_available,
-        "available_slot_count": len(available_slots),
-        "slots": [
-            {
-                "startDateTime": s.get("startDateTime"),
-                "endDateTime": s.get("endDateTime"),
-                "capacity": s.get("capacity"),
-                "originalCapacity": s.get("originalCapacity"),
-                "calendarGroupLabel": s.get("calendarGroupLabel"),
-            }
-            for s in slots
-        ],
-    }
-
-
-def load_state() -> dict:
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE) as f:
-            try:
-                return json.load(f)
-            except json.JSONDecodeError:
-                return {}
-    return {}
-
-
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-
-def send_email(changes: list, current_by_event: dict) -> None:
-    subject = f"Colosseum tickets — Aug 7 availability opened! ({len(changes)} event(s))"
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    body_parts = [
-        f"Availability opened up for August 7 on the Colosseum ticketing site!",
-        f"Detected at: {timestamp}",
-        "",
-    ]
-    for name in changes:
-        summary = current_by_event[name]
-        url = EVENTS[name]["page_url"]
-        body_parts.append(f"{name}")
-        body_parts.append(f"  {summary['available_slot_count']} slot(s), "
-                           f"{summary['total_available_capacity']} total spot(s) available")
-        for s in summary["slots"]:
-            if s["capacity"] > 0:
-                body_parts.append(
-                    f"    {s['startDateTime']} - {s['endDateTime']}: "
-                    f"{s['capacity']} spot(s) ({s.get('calendarGroupLabel', '')})"
-                )
-        body_parts.append(f"  BOOK NOW: {url}")
-        body_parts.append("")
-
-    body = "\n".join(body_parts)
-
-    msg = MIMEMultipart()
-    msg["From"]    = EMAIL_SENDER
-    msg["To"]      = ", ".join(RECIPIENT_LIST)
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-        server.sendmail(EMAIL_SENDER, RECIPIENT_LIST, msg.as_string())
-
-    print(f"  Alert sent to {RECIPIENT_LIST}")
+    print(f"    Status: {status}, length: {len(text)}")
+    stripped = text.strip()
+    if stripped.startswith("{") or stripped.startswith("["):
+        print(f"    JSON body: {stripped[:1500]}")
+    else:
+        print(f"    Non-JSON body (first 600): {stripped[:600]}")
 
 
 def main() -> None:
-    print(f"[{datetime.now().isoformat()}] Checking Aug 7 availability...")
-    if PROXY_URL:
-        # Never print the URL itself — it embeds proxy credentials.
-        print(f"  Routing through proxy host: {PROXY_URL.split('@')[-1]}")
-    else:
-        print("  No proxy configured — connecting directly.")
+    print(f"[{datetime.now().isoformat()}] Acuity discovery run")
+    print(f"BOOKING_URL: {BOOKING_URL}\n")
 
-    state = load_state()
-    previous = state.get("events", {})
-    current_by_event = {}
-    changed_events = []
-
-    for name, cfg in EVENTS.items():
-        page_id = cfg["page_id"]
-        if not page_id:
-            print(f"  Skipping '{name}' — no page_id configured.")
-            continue
-
+    # ── 1. Fetch the booking page itself ──
+    print("### STEP 1: main booking page ###")
+    html = ""
+    try:
+        status, html = fetch(BOOKING_URL, HEADERS)
+        print(f"  Status: {status}")
+        print(f"  Length: {len(html)}")
+        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+        print(f"  Title: {m.group(1).strip() if m else '(none)'}")
+    except HTTPError as e:
+        print(f"  HTTPError {e.code} {e.reason}")
         try:
-            data = fetch_calendar_month(page_id, cfg["page_url"])
-        except HTTPError as e:
-            print(f"  [{name}] HTTPError: {e.code} {e.reason}")
-            try:
-                print(f"    Body: {e.read().decode('utf-8', errors='replace')[:2000]}")
-            except Exception:
-                pass
-            continue
-        except URLError as e:
-            print(f"  [{name}] URLError: {e}")
-            continue
-        except Exception as e:
-            print(f"  [{name}] Unexpected error: {e}")
-            continue
+            html = e.read().decode("utf-8", errors="replace")
+            print(f"  Body (first 1000): {html[:1000]}")
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"  Error: {e}")
 
-        if not data.get("success"):
-            print(f"  [{name}] API returned success=false: {json.dumps(data)[:500]}")
-            continue
+    if html:
+        # Owner ID is needed for the classic schedule.php endpoints
+        for pat in [r'owner["\']?\s*[:=]\s*["\']?(\d{4,})',
+                    r'data-owner=["\'](\d{4,})["\']',
+                    r'ownerId["\']?\s*[:=]\s*["\']?(\d{4,})']:
+            found = re.findall(pat, html, re.I)
+            if found:
+                print(f"  Owner ID candidates via /{pat}/: {sorted(set(found))[:5]}")
 
-        day_slots = slots_for_target_date(data)
-        summary = summarize(day_slots)
-        current_by_event[name] = summary
+        print("\n  Availability-related keywords present in page:")
+        for hint in AVAILABILITY_HINTS:
+            n = len(re.findall(re.escape(hint), html, re.I))
+            if n:
+                print(f"    {hint}: {n}")
 
-        prev_summary = previous.get(name)
-        prev_available = prev_summary.get("total_available_capacity", 0) if prev_summary else 0
-        curr_available = summary["total_available_capacity"]
+        # Any inline JSON blobs
+        for pat, label in [
+            (r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>', "application/json"),
+            (r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;', "__INITIAL_STATE__"),
+            (r'window\.acuity\w*\s*=\s*(\{.*?\})\s*;', "window.acuity*"),
+        ]:
+            for mm in re.finditer(pat, html, re.I | re.S):
+                print(f"\n  JSON blob [{label}] (first 1200): {mm.group(1)[:1200]}")
 
-        print(f"  [{name}] {summary['available_slot_count']} slot(s) available, "
-              f"{curr_available} total spot(s) (was {prev_available})")
+        # Look for API paths referenced in the page
+        api_paths = sorted(set(re.findall(r'["\'](/api/[A-Za-z0-9/_\-{}.]+)["\']', html)))
+        print(f"\n  /api/ paths referenced in page ({len(api_paths)}):")
+        for p in api_paths[:40]:
+            print(f"    {p}")
 
-        if curr_available > 0 and curr_available > prev_available:
-            changed_events.append(name)
+        # Telltale 'no availability' phrasing
+        for phrase in ["no times", "not available", "no availability",
+                       "fully booked", "sold out", "no appointments"]:
+            if phrase in html.lower():
+                print(f"  NOTE: page contains phrase '{phrase}'")
 
-    if changed_events:
-        print(f"  Availability opened for: {changed_events} — sending alert...")
-        try:
-            send_email(changed_events, current_by_event)
-        except Exception as e:
-            print(f"  Email failed: {e}")
-    else:
-        print("  No new availability.")
+        mid = len(html) // 2
+        print(f"\n  Raw HTML sample (middle 1200 chars):\n{html[mid:mid+1200]}")
 
-    state["events"] = current_by_event
-    state["checked_at"] = datetime.now().isoformat()
-    save_state(state)
+    # ── 2. Probe candidate availability endpoints ──
+    print("\n### STEP 2: probing candidate availability endpoints ###")
+    for month in MONTHS:
+        probe(
+            f"scheduling-page availability/dates {month}",
+            f"https://app.acuityscheduling.com/api/scheduling-page/{SLUG}"
+            f"/availability/dates?appointmentTypeId={APPOINTMENT_TYPE_ID}"
+            f"&calendarId={CALENDAR_ID}&month={month}",
+            JSON_HEADERS,
+        )
+        probe(
+            f"classic showCalendar {month}",
+            f"https://app.acuityscheduling.com/schedule.php?action=showCalendar"
+            f"&fulldate=1&owner={SLUG}&type={APPOINTMENT_TYPE_ID}"
+            f"&calendarID={CALENDAR_ID}&month={month}",
+            JSON_HEADERS,
+        )
+
+    probe(
+        "appointment-types",
+        f"https://app.acuityscheduling.com/api/scheduling-page/{SLUG}/appointment-types",
+        JSON_HEADERS,
+    )
+    probe(
+        "scheduling-page root",
+        f"https://app.acuityscheduling.com/api/scheduling-page/{SLUG}",
+        JSON_HEADERS,
+    )
 
 
 if __name__ == "__main__":
