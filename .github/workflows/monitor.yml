@@ -9,7 +9,7 @@ on:
 
 jobs:
   check:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
 
     permissions:
       contents: write
@@ -18,12 +18,18 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
       - name: Run monitor
         env:
+          PROXY_URL:        ${{ secrets.PROXY_URL }}
           EMAIL_SENDER:     ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD:   ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECIPIENT:  ${{ secrets.EMAIL_RECIPIENT }}
-        run: python3 monitor.py
+        run: python monitor.py
 
       - name: Commit updated state
         run: |
