@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Acuity Scheduling Availability Monitor — DISCOVERY MODE v2
+Acuity Scheduling Availability Monitor — DISCOVERY MODE v3
 
-First pass found the page is reachable (HTTP 200) and revealed the numeric
-owner ID (22283479) — the earlier probes 404'd because they used the URL
-slug instead. This pass dumps the page's embedded JSON config and probes
-Acuity's classic schedule.php endpoints with the correct owner ID.
+The booking page is a Squarespace Scheduling React SPA, so availability
+comes from a JSON API the bundle calls at runtime. Classic schedule.php
+endpoints are dead for this page. This pass downloads the JS bundle(s)
+referenced by the page and greps them for the actual API paths, then
+probes the best candidates.
 """
 
-import json
 import re
 from datetime import datetime
 from urllib.request import urlopen, Request
-from urllib.error import URLError, HTTPError
+from urllib.error import HTTPError
 
 BOOKING_URL = (
     "https://app.acuityscheduling.com/schedule/ce551904"
@@ -24,106 +24,81 @@ OWNER_ID            = "22283479"
 APPOINTMENT_TYPE_ID = "71567018"
 CALENDAR_ID         = "11158185"
 
-MONTHS = ["2026-07", "2026-08"]
-
 HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": "*/*",
     "Accept-Language": "en-US,en;q=0.9",
 }
 
 AJAX_HEADERS = dict(HEADERS)
-AJAX_HEADERS["Accept"] = "*/*"
 AJAX_HEADERS["X-Requested-With"] = "XMLHttpRequest"
 AJAX_HEADERS["Referer"] = BOOKING_URL
 
+# Terms that would appear near availability API paths
+KEYWORDS = [
+    "datesAvailable", "availableDates", "availability", "availableTimes",
+    "times", "openings", "slots", "calendar",
+]
 
-def fetch(url: str, headers: dict, timeout: int = 30) -> tuple[int, str]:
+
+def get(url: str, headers: dict, timeout: int = 60) -> tuple[int, str]:
     req = Request(url, headers=headers, method="GET")
     with urlopen(req, timeout=timeout) as resp:
         return resp.status, resp.read().decode("utf-8", errors="replace")
 
 
-def probe(label: str, url: str) -> None:
-    print(f"\n  PROBE [{label}]")
-    print(f"    URL: {url}")
-    try:
-        status, text = fetch(url, AJAX_HEADERS)
-    except HTTPError as e:
-        print(f"    HTTPError {e.code} {e.reason}")
-        try:
-            print(f"    Body: {e.read().decode('utf-8', errors='replace')[:400]}")
-        except Exception:
-            pass
-        return
-    except Exception as e:
-        print(f"    Error: {e}")
-        return
-
-    print(f"    Status: {status}, length: {len(text)}")
-    s = text.strip()
-    if s.startswith("{") or s.startswith("["):
-        print(f"    JSON: {s[:2500]}")
-    else:
-        # Calendar HTML — surface the availability-bearing bits
-        classes = sorted(set(re.findall(r'class="([^"]*(?:day|avail|time|slot)[^"]*)"', s, re.I)))
-        print(f"    HTML. Interesting classes: {classes[:25]}")
-        for phrase in ["no times", "not available", "no availability",
-                       "fully booked", "sold out", "no appointments", "unavailable"]:
-            if phrase in s.lower():
-                print(f"    Contains phrase: '{phrase}'")
-        print(f"    First 1500 chars: {s[:1500]}")
-
-
 def main() -> None:
-    print(f"[{datetime.now().isoformat()}] Acuity discovery v2")
+    print(f"[{datetime.now().isoformat()}] Acuity discovery v3 — JS bundle analysis")
 
-    # ── 1. Full page dump ──
-    print("\n### STEP 1: full booking page ###")
-    html = ""
+    # ── 1. Get script URLs from the page ──
     try:
-        status, html = fetch(BOOKING_URL, HEADERS)
-        print(f"  Status: {status}, length: {len(html)}")
+        _, html = get(BOOKING_URL, HEADERS)
     except Exception as e:
-        print(f"  Error: {e}")
+        print(f"  Failed to load page: {e}")
+        return
 
-    if html:
-        print("\n  ── FULL PAGE HTML ──")
-        chunk = 3000
-        for i in range(0, len(html), chunk):
-            print(f"  [chars {i}-{i+chunk}]\n{html[i:i+chunk]}")
+    scripts = re.findall(r'<script[^>]*src=["\']?([^"\'\s>]+)', html, re.I)
+    scripts = [s for s in scripts if s.endswith(".js")]
+    print(f"\n  Script URLs found ({len(scripts)}):")
+    for s in scripts:
+        print(f"    {s}")
 
-        # Pull out the appointment type entry matching our URL
-        for m in re.finditer(r'\{"id":' + APPOINTMENT_TYPE_ID + r'.{0,700}', html):
-            print(f"\n  APPOINTMENT TYPE {APPOINTMENT_TYPE_ID} entry: {m.group(0)}")
+    # ── 2. Download and grep each bundle for API paths ──
+    all_paths = set()
+    for src in scripts:
+        if "recaptcha" in src or "trustarc" in src:
+            continue
+        url = src if src.startswith("http") else f"https://app.acuityscheduling.com{src}"
+        print(f"\n### Bundle: {url}")
+        try:
+            status, js = get(url, HEADERS)
+        except Exception as e:
+            print(f"    Error: {e}")
+            continue
+        print(f"    Status {status}, {len(js)} chars")
 
-    # ── 2. Probe classic endpoints with the REAL owner id ──
-    print("\n\n### STEP 2: classic schedule.php probes (owner=%s) ###" % OWNER_ID)
-    for month in MONTHS:
-        probe(
-            f"showCalendar {month}",
-            f"https://app.acuityscheduling.com/schedule.php?action=showCalendar"
-            f"&fulldate=1&owner={OWNER_ID}&type={APPOINTMENT_TYPE_ID}"
-            f"&calendarID={CALENDAR_ID}&month={month}",
-        )
-        probe(
-            f"availableDates {month}",
-            f"https://app.acuityscheduling.com/schedule.php?action=availableDates"
-            f"&owner={OWNER_ID}&type={APPOINTMENT_TYPE_ID}"
-            f"&calendarID={CALENDAR_ID}&month={month}",
-        )
+        # Absolute/relative API-ish path literals
+        paths = set(re.findall(r'["\'`](/(?:api|schedule)[A-Za-z0-9/_\-.{}$:]*)["\'`]', js))
+        # Template-literal paths with interpolation
+        paths |= set(re.findall(r'["\'`](/[A-Za-z0-9/_\-.]*\$\{[^}`]*\}[A-Za-z0-9/_\-.${}]*)["\'`]', js))
+        all_paths |= paths
+        print(f"    API-ish path literals: {len(paths)}")
+        for p in sorted(paths)[:60]:
+            print(f"      {p}")
 
-    probe(
-        "showSelect (type chooser)",
-        f"https://app.acuityscheduling.com/schedule.php?action=showSelect&owner={OWNER_ID}",
-    )
-    probe(
-        "plain schedule.php owner page",
-        f"https://app.acuityscheduling.com/schedule.php?owner={OWNER_ID}",
-    )
+        print("    Keyword hits with surrounding context:")
+        for kw in KEYWORDS:
+            for m in list(re.finditer(re.escape(kw), js))[:3]:
+                a, b = max(0, m.start() - 130), min(len(js), m.end() + 130)
+                snippet = js[a:b].replace("\n", " ")
+                print(f"      [{kw}] ...{snippet}...")
+
+    print(f"\n\n### All distinct API-ish paths across bundles ({len(all_paths)}) ###")
+    for p in sorted(all_paths):
+        print(f"  {p}")
 
 
 if __name__ == "__main__":
