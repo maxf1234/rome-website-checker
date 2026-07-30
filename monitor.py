@@ -49,9 +49,11 @@ API_URL = "https://app.acuityscheduling.com/api/scheduling/v1/availability/month
 MONTHS_AHEAD = int(os.environ.get("MONTHS_AHEAD", "6"))
 STATE_FILE   = "state.json"
 
-# Long-poll settings
+# Polling settings. RUN_DURATION_SEC = 0 means "check once and exit", which
+# is the normal mode when the workflow cron drives the schedule. Setting it
+# higher makes one run stay alive and poll, for sub-cron-granularity checks.
 CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "60"))
-RUN_DURATION_SEC   = int(os.environ.get("RUN_DURATION_SEC", str(32 * 60)))
+RUN_DURATION_SEC   = int(os.environ.get("RUN_DURATION_SEC", "0"))
 
 EMAIL_SENDER    = os.environ["EMAIL_SENDER"]
 EMAIL_PASSWORD  = os.environ["EMAIL_PASSWORD"]
@@ -229,8 +231,11 @@ def main() -> None:
     log(f"  {APPOINTMENT_NAME}")
     log(BAR)
     log(f"  Started        {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    log(f"  Checking every {CHECK_INTERVAL_SEC}s "
-        f"for {RUN_DURATION_SEC // 60} min")
+    if RUN_DURATION_SEC > 0:
+        log(f"  Mode           polling every {CHECK_INTERVAL_SEC}s "
+            f"for {RUN_DURATION_SEC // 60} min")
+    else:
+        log("  Mode           single check (schedule driven by workflow cron)")
     log(f"  Scanning       {len(months)} months "
         f"({months[0]} → {months[-1]})")
     log(f"  Alerts to      {', '.join(RECIPIENT_LIST)}")
@@ -246,7 +251,8 @@ def main() -> None:
     alerts_sent = 0
     consecutive_errors = 0
 
-    while time.time() < deadline:
+    # Always run at least one check, even when RUN_DURATION_SEC is 0.
+    while True:
         check_num += 1
         dates, err_count, err_msgs = run_check()
 
@@ -297,9 +303,11 @@ def main() -> None:
 
     log("")
     log(BAR)
-    log(f"  Run complete — {check_num} checks, {alerts_sent} alert(s) sent")
+    if check_num > 1:
+        log(f"  Run complete — {check_num} checks, {alerts_sent} alert(s) sent")
+    else:
+        log(f"  Check complete — {alerts_sent} alert(s) sent")
     log(f"  Currently available: {sorted(known) if known else 'none'}")
-    log(f"  Next run takes over shortly.")
     log(BAR)
 
 
