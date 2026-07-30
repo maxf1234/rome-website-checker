@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """
-Acuity Scheduling Availability Monitor — DISCOVERY MODE v5
+Acuity Scheduling Availability Monitor — DISCOVERY MODE v6
 
-v4 confirmed `/api/scheduling/v1/availability/month` is the right endpoint
-(401 Unauthorized, not 404). This pass works out the auth: first tries
-carrying session cookies from loading the booking page, then greps the
-bundle for whatever header/token the SPA attaches.
+v5 found the auth headers the SPA attaches: `X-Secondo-Session` (set as an
+axios default) and `X-Secondo-Owner`, plus the real endpoint constants
+(/availability/month, /availability/times) and plural param names
+(appointmentTypeIds, calendarIds). This pass probes that combination and
+greps for how the session value is produced.
 """
 
 import http.cookiejar
 import re
+import uuid
 from datetime import datetime
 from urllib.request import Request, build_opener, HTTPCookieProcessor
 from urllib.error import HTTPError
@@ -33,14 +35,13 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 PAGE_HEADERS = {
     "User-Agent": UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
 }
 
 API_HEADERS = {
     "User-Agent": UA,
     "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
     "Referer": BOOKING_URL,
+    "Origin": "https://app.acuityscheduling.com",
     "X-Requested-With": "XMLHttpRequest",
 }
 
@@ -54,94 +55,82 @@ def get(url: str, headers: dict, timeout: int = 60) -> tuple[int, str]:
         return resp.status, resp.read().decode("utf-8", errors="replace")
 
 
-def probe(label: str, url: str, extra_headers: dict | None = None) -> None:
+def probe(label: str, url: str, extra: dict) -> bool:
     h = dict(API_HEADERS)
-    if extra_headers:
-        h.update(extra_headers)
-    print(f"\n  PROBE [{label}]")
+    h.update(extra)
+    print(f"\n  [{label}]")
     print(f"    {url}")
-    if extra_headers:
-        print(f"    extra headers: {list(extra_headers.keys())}")
+    print(f"    headers: { {k: v for k, v in extra.items()} }")
     try:
         status, text = get(url, h)
     except HTTPError as e:
         body = ""
         try:
-            body = e.read().decode("utf-8", errors="replace")[:300]
+            body = e.read().decode("utf-8", errors="replace")[:250]
         except Exception:
             pass
-        print(f"    HTTP {e.code} {e.reason} :: {body}")
-        return
+        print(f"    HTTP {e.code} :: {body}")
+        return False
     except Exception as e:
         print(f"    Error: {e}")
-        return
-    print(f"    HTTP {status}, {len(text)} chars")
-    print(f"    Body: {text[:2500]}")
+        return False
+    print(f"    *** HTTP {status}, {len(text)} chars ***")
+    print(f"    Body: {text[:3000]}")
+    return True
 
 
 def main() -> None:
-    print(f"[{datetime.now().isoformat()}] Acuity discovery v5 — auth")
+    print(f"[{datetime.now().isoformat()}] Acuity discovery v6 — Secondo headers")
 
-    # ── 1. Load booking page to establish a session ──
-    print("\n### STEP 1: load page for cookies ###")
-    html = ""
     try:
-        status, html = get(BOOKING_URL, PAGE_HEADERS)
-        print(f"  page HTTP {status}, {len(html)} chars")
+        _, html = get(BOOKING_URL, PAGE_HEADERS)
     except Exception as e:
         print(f"  page load error: {e}")
+        html = ""
 
-    print(f"  Cookies obtained ({len(jar)}):")
-    for c in jar:
-        val = c.value or ""
-        print(f"    {c.name} = {val[:40]}{'...' if len(val) > 40 else ''}  (domain={c.domain})")
+    # window.BUSINESS holds owner context the interceptor reads
+    for m in list(re.finditer(r"window\.BUSINESS\s*=\s*(\{.{0,1500})", html, re.S))[:2]:
+        print(f"\n  window.BUSINESS = {m.group(1)[:1500]}")
+    for m in list(re.finditer(r"BUSINESS", html))[:6]:
+        a, b = max(0, m.start() - 200), min(len(html), m.end() + 400)
+        print(f"\n  [BUSINESS ctx] ...{html[a:b]}...")
 
-    # Any token embedded directly in the page?
-    for pat in [r'["\']?(?:csrf|token|apiKey|api_key|authToken)["\']?\s*[:=]\s*["\']([A-Za-z0-9._\-]{16,})["\']',
-                r'window\.__[A-Z_]+__\s*=\s*(\{.{0,600})']:
-        for m in list(re.finditer(pat, html, re.I))[:5]:
-            print(f"  page token candidate: {m.group(0)[:200]}")
+    session = str(uuid.uuid4())
+    print(f"\n  Using generated X-Secondo-Session: {session}")
 
-    # ── 2. Retry the availability endpoint WITH session cookies ──
-    print("\n\n### STEP 2: availability/month with session cookies ###")
-    param_sets = [
-        f"appointmentTypeID={APPOINTMENT_TYPE_ID}&calendarID={CALENDAR_ID}&month={MONTH}",
-        f"appointmentTypeId={APPOINTMENT_TYPE_ID}&calendarId={CALENDAR_ID}&month={MONTH}",
-        f"owner={OWNER_ID}&appointmentTypeID={APPOINTMENT_TYPE_ID}&calendarID={CALENDAR_ID}&month={MONTH}",
-        f"ownerKey={SLUG}&appointmentTypeID={APPOINTMENT_TYPE_ID}&calendarID={CALENDAR_ID}&month={MONTH}",
-    ]
-    for i, qs in enumerate(param_sets):
-        probe(f"month params#{i}", f"{BASE}/availability/month?{qs}")
+    plural = f"appointmentTypeIds={APPOINTMENT_TYPE_ID}&calendarIds={CALENDAR_ID}&month={MONTH}"
+    singular = f"appointmentTypeID={APPOINTMENT_TYPE_ID}&calendarID={CALENDAR_ID}&month={MONTH}"
 
-    # Some Squarespace Scheduling deployments key off an owner header
-    probe("month + X-Secondo-Owner", f"{BASE}/availability/month?{param_sets[0]}",
-          {"X-Secondo-Owner": OWNER_ID})
-    probe("month + owner-key header", f"{BASE}/availability/month?{param_sets[0]}",
-          {"X-Owner-Key": SLUG})
+    print("\n\n### Probing /availability/month with Secondo headers ###")
+    ok = False
+    for owner_val in (SLUG, OWNER_ID):
+        for qs_label, qs in (("plural", plural), ("singular", singular)):
+            ok |= probe(
+                f"owner={owner_val} {qs_label} +session",
+                f"{BASE}/availability/month?{qs}",
+                {"X-Secondo-Owner": owner_val, "X-Secondo-Session": session},
+            )
+            ok |= probe(
+                f"owner={owner_val} {qs_label} (no session)",
+                f"{BASE}/availability/month?{qs}",
+                {"X-Secondo-Owner": owner_val},
+            )
 
-    # ── 3. Grep bundle for auth mechanics ──
-    print("\n\n### STEP 3: bundle auth grep ###")
+    # ── Grep for how X-Secondo-Session's value is produced ──
+    print("\n\n### Bundle grep: session value + owner interceptor ###")
     scripts = [s for s in re.findall(r'<script[^>]*src=["\']?([^"\'\s>]+)', html, re.I)
                if s.endswith(".js") and "scheduling-pylon" in s and "errorReporter" not in s]
     for src in scripts:
         url = src if src.startswith("http") else f"https://app.acuityscheduling.com{src}"
-        print(f"\n  Bundle: {url}")
         try:
             _, js = get(url, PAGE_HEADERS)
         except Exception as e:
-            print(f"    error: {e}")
+            print(f"  bundle error: {e}")
             continue
-        print(f"    {len(js)} chars")
-
-        for kw in ["Authorization", "Bearer", "X-Secondo", "authToken",
-                   "availability/month", "ownerKey:", "X-CSRF"]:
-            hits = list(re.finditer(re.escape(kw), js))[:3]
-            if not hits:
-                continue
-            print(f"    --- {kw} ({len(hits)} shown) ---")
-            for m in hits:
-                a, b = max(0, m.start() - 350), min(len(js), m.end() + 350)
-                print(f"      ...{js[a:b]}...")
+        for kw in ['X-Secondo-Session', 'sessionStorage', 'X-Secondo-Owner']:
+            for m in list(re.finditer(re.escape(kw), js))[:3]:
+                a, b = max(0, m.start() - 500), min(len(js), m.end() + 700)
+                print(f"\n  --- {kw} ---\n  ...{js[a:b]}...")
 
 
 if __name__ == "__main__":
