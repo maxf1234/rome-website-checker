@@ -1,136 +1,106 @@
 #!/usr/bin/env python3
 """
-Acuity Scheduling Availability Monitor — DISCOVERY MODE v6
+Acuity Scheduling Availability Monitor — DISCOVERY MODE v7 (browser)
 
-v5 found the auth headers the SPA attaches: `X-Secondo-Session` (set as an
-axios default) and `X-Secondo-Owner`, plus the real endpoint constants
-(/availability/month, /availability/times) and plural param names
-(appointmentTypeIds, calendarIds). This pass probes that combination and
-greps for how the session value is produced.
+Reverse-engineering the SPA's auth (X-Secondo-Session comes from an opaque
+bundle constant) hit diminishing returns. Driving a real browser sidesteps
+it entirely: the page authenticates itself, and we can both read the
+rendered calendar and capture the exact availability API call it makes.
 """
 
-import http.cookiejar
-import re
-import uuid
+import json
 from datetime import datetime
-from urllib.request import Request, build_opener, HTTPCookieProcessor
-from urllib.error import HTTPError
+from playwright.sync_api import sync_playwright
 
 BOOKING_URL = (
     "https://app.acuityscheduling.com/schedule/ce551904"
     "/appointment/71567018/calendar/11158185"
 )
 
-SLUG                = "ce551904"
-OWNER_ID            = "22283479"
-APPOINTMENT_TYPE_ID = "71567018"
-CALENDAR_ID         = "11158185"
-MONTH               = "2026-08"
-
-BASE = "https://app.acuityscheduling.com/api/scheduling/v1"
-
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-
-PAGE_HEADERS = {
-    "User-Agent": UA,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
-
-API_HEADERS = {
-    "User-Agent": UA,
-    "Accept": "application/json, text/plain, */*",
-    "Referer": BOOKING_URL,
-    "Origin": "https://app.acuityscheduling.com",
-    "X-Requested-With": "XMLHttpRequest",
-}
-
-jar = http.cookiejar.CookieJar()
-opener = build_opener(HTTPCookieProcessor(jar))
-
-
-def get(url: str, headers: dict, timeout: int = 60) -> tuple[int, str]:
-    req = Request(url, headers=headers, method="GET")
-    with opener.open(req, timeout=timeout) as resp:
-        return resp.status, resp.read().decode("utf-8", errors="replace")
-
-
-def probe(label: str, url: str, extra: dict) -> bool:
-    h = dict(API_HEADERS)
-    h.update(extra)
-    print(f"\n  [{label}]")
-    print(f"    {url}")
-    print(f"    headers: { {k: v for k, v in extra.items()} }")
-    try:
-        status, text = get(url, h)
-    except HTTPError as e:
-        body = ""
-        try:
-            body = e.read().decode("utf-8", errors="replace")[:250]
-        except Exception:
-            pass
-        print(f"    HTTP {e.code} :: {body}")
-        return False
-    except Exception as e:
-        print(f"    Error: {e}")
-        return False
-    print(f"    *** HTTP {status}, {len(text)} chars ***")
-    print(f"    Body: {text[:3000]}")
-    return True
+INTERESTING = ("/api/scheduling/v1", "availability", "schedule.php")
 
 
 def main() -> None:
-    print(f"[{datetime.now().isoformat()}] Acuity discovery v6 — Secondo headers")
+    print(f"[{datetime.now().isoformat()}] Acuity discovery v7 — headless browser")
 
-    try:
-        _, html = get(BOOKING_URL, PAGE_HEADERS)
-    except Exception as e:
-        print(f"  page load error: {e}")
-        html = ""
+    captured = []
 
-    # window.BUSINESS holds owner context the interceptor reads
-    for m in list(re.finditer(r"window\.BUSINESS\s*=\s*(\{.{0,1500})", html, re.S))[:2]:
-        print(f"\n  window.BUSINESS = {m.group(1)[:1500]}")
-    for m in list(re.finditer(r"BUSINESS", html))[:6]:
-        a, b = max(0, m.start() - 200), min(len(html), m.end() + 400)
-        print(f"\n  [BUSINESS ctx] ...{html[a:b]}...")
+    with sync_playwright() as p:
+        browser = p.chromium.launch()
+        ctx = browser.new_context(
+            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0.0.0 Safari/537.36"),
+            locale="en-US",
+        )
+        page = ctx.new_page()
 
-    session = str(uuid.uuid4())
-    print(f"\n  Using generated X-Secondo-Session: {session}")
+        def on_response(resp):
+            url = resp.url
+            if not any(k in url for k in INTERESTING):
+                return
+            entry = {
+                "url": url,
+                "status": resp.status,
+                "request_headers": dict(resp.request.headers),
+                "method": resp.request.method,
+            }
+            try:
+                entry["body"] = resp.text()[:4000]
+            except Exception as e:
+                entry["body"] = f"(unreadable: {e})"
+            captured.append(entry)
 
-    plural = f"appointmentTypeIds={APPOINTMENT_TYPE_ID}&calendarIds={CALENDAR_ID}&month={MONTH}"
-    singular = f"appointmentTypeID={APPOINTMENT_TYPE_ID}&calendarID={CALENDAR_ID}&month={MONTH}"
+        page.on("response", on_response)
 
-    print("\n\n### Probing /availability/month with Secondo headers ###")
-    ok = False
-    for owner_val in (SLUG, OWNER_ID):
-        for qs_label, qs in (("plural", plural), ("singular", singular)):
-            ok |= probe(
-                f"owner={owner_val} {qs_label} +session",
-                f"{BASE}/availability/month?{qs}",
-                {"X-Secondo-Owner": owner_val, "X-Secondo-Session": session},
-            )
-            ok |= probe(
-                f"owner={owner_val} {qs_label} (no session)",
-                f"{BASE}/availability/month?{qs}",
-                {"X-Secondo-Owner": owner_val},
-            )
+        print(f"  Loading {BOOKING_URL}")
+        page.goto(BOOKING_URL, wait_until="networkidle", timeout=90_000)
+        page.wait_for_timeout(6000)
 
-    # ── Grep for how X-Secondo-Session's value is produced ──
-    print("\n\n### Bundle grep: session value + owner interceptor ###")
-    scripts = [s for s in re.findall(r'<script[^>]*src=["\']?([^"\'\s>]+)', html, re.I)
-               if s.endswith(".js") and "scheduling-pylon" in s and "errorReporter" not in s]
-    for src in scripts:
-        url = src if src.startswith("http") else f"https://app.acuityscheduling.com{src}"
+        print(f"\n  Page title: {page.title()}")
+
+        # ── What the user actually sees ──
         try:
-            _, js = get(url, PAGE_HEADERS)
+            body_text = page.inner_text("body")
         except Exception as e:
-            print(f"  bundle error: {e}")
-            continue
-        for kw in ['X-Secondo-Session', 'sessionStorage', 'X-Secondo-Owner']:
-            for m in list(re.finditer(re.escape(kw), js))[:3]:
-                a, b = max(0, m.start() - 500), min(len(js), m.end() + 700)
-                print(f"\n  --- {kw} ---\n  ...{js[a:b]}...")
+            body_text = f"(could not read body: {e})"
+        print(f"\n  ── RENDERED PAGE TEXT ──\n{body_text[:5000]}")
+
+        # ── Calendar day buttons and their state ──
+        print("\n  ── CALENDAR DAY ELEMENTS ──")
+        for sel in ['[role="gridcell"]', "button[aria-label]", "[class*=day]",
+                    "[data-testid*=day]", "[class*=Day]"]:
+            try:
+                els = page.query_selector_all(sel)
+            except Exception:
+                continue
+            if not els:
+                continue
+            print(f"\n    selector {sel}: {len(els)} elements (first 25)")
+            for el in els[:25]:
+                try:
+                    txt = (el.inner_text() or "").strip().replace("\n", " ")
+                    aria = el.get_attribute("aria-label")
+                    disabled = el.get_attribute("disabled")
+                    aria_dis = el.get_attribute("aria-disabled")
+                    cls = (el.get_attribute("class") or "")[:70]
+                    print(f"      text={txt[:30]!r} aria={aria!r} "
+                          f"disabled={disabled} aria-disabled={aria_dis} class={cls!r}")
+                except Exception:
+                    pass
+
+        page.screenshot(path="page.png", full_page=True)
+        print("\n  Screenshot saved to page.png")
+
+        browser.close()
+
+    # ── The API calls the page made ──
+    print(f"\n\n  ── CAPTURED API CALLS ({len(captured)}) ──")
+    for c in captured:
+        print(f"\n  {c['method']} {c['url']}")
+        print(f"    status: {c['status']}")
+        print(f"    request headers: {json.dumps(c['request_headers'], indent=6)[:1500]}")
+        print(f"    response body: {c['body'][:3000]}")
 
 
 if __name__ == "__main__":
