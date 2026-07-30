@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-Acuity Scheduling Availability Monitor — DISCOVERY MODE
+Acuity Scheduling Availability Monitor — DISCOVERY MODE v2
 
-Probes the target Acuity booking page to learn how it exposes availability
-before the real monitoring logic is written. Dumps page structure, embedded
-JSON/config, and the results of probing Acuity's known availability API
-endpoint shapes.
-
-Run this via the GitHub Action once, read the job logs, then replace this
-with the real check.
+First pass found the page is reachable (HTTP 200) and revealed the numeric
+owner ID (22283479) — the earlier probes 404'd because they used the URL
+slug instead. This pass dumps the page's embedded JSON config and probes
+Acuity's classic schedule.php endpoints with the correct owner ID.
 """
 
 import json
@@ -23,10 +20,11 @@ BOOKING_URL = (
 )
 
 SLUG                = "ce551904"
+OWNER_ID            = "22283479"
 APPOINTMENT_TYPE_ID = "71567018"
 CALENDAR_ID         = "11158185"
 
-MONTHS = ["2026-07", "2026-08", "2026-09"]
+MONTHS = ["2026-07", "2026-08"]
 
 HEADERS = {
     "User-Agent": (
@@ -37,17 +35,10 @@ HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
 }
 
-JSON_HEADERS = dict(HEADERS)
-JSON_HEADERS["Accept"] = "application/json, text/plain, */*"
-JSON_HEADERS["X-Requested-With"] = "XMLHttpRequest"
-JSON_HEADERS["Referer"] = BOOKING_URL
-
-# Interesting keys that would indicate availability data
-AVAILABILITY_HINTS = [
-    "availableDates", "available", "slots", "times", "openings",
-    "soldOut", "isAvailable", "noTimes", "calendarID", "appointmentTypeID",
-    "owner", "firstAvailable",
-]
+AJAX_HEADERS = dict(HEADERS)
+AJAX_HEADERS["Accept"] = "*/*"
+AJAX_HEADERS["X-Requested-With"] = "XMLHttpRequest"
+AJAX_HEADERS["Referer"] = BOOKING_URL
 
 
 def fetch(url: str, headers: dict, timeout: int = 30) -> tuple[int, str]:
@@ -56,122 +47,82 @@ def fetch(url: str, headers: dict, timeout: int = 30) -> tuple[int, str]:
         return resp.status, resp.read().decode("utf-8", errors="replace")
 
 
-def probe(label: str, url: str, headers: dict) -> None:
-    print(f"  PROBE [{label}]")
+def probe(label: str, url: str) -> None:
+    print(f"\n  PROBE [{label}]")
     print(f"    URL: {url}")
     try:
-        status, text = fetch(url, headers)
+        status, text = fetch(url, AJAX_HEADERS)
     except HTTPError as e:
         print(f"    HTTPError {e.code} {e.reason}")
         try:
-            print(f"    Body: {e.read().decode('utf-8', errors='replace')[:600]}")
+            print(f"    Body: {e.read().decode('utf-8', errors='replace')[:400]}")
         except Exception:
             pass
-        return
-    except URLError as e:
-        print(f"    URLError: {e}")
         return
     except Exception as e:
         print(f"    Error: {e}")
         return
 
     print(f"    Status: {status}, length: {len(text)}")
-    stripped = text.strip()
-    if stripped.startswith("{") or stripped.startswith("["):
-        print(f"    JSON body: {stripped[:1500]}")
+    s = text.strip()
+    if s.startswith("{") or s.startswith("["):
+        print(f"    JSON: {s[:2500]}")
     else:
-        print(f"    Non-JSON body (first 600): {stripped[:600]}")
+        # Calendar HTML — surface the availability-bearing bits
+        classes = sorted(set(re.findall(r'class="([^"]*(?:day|avail|time|slot)[^"]*)"', s, re.I)))
+        print(f"    HTML. Interesting classes: {classes[:25]}")
+        for phrase in ["no times", "not available", "no availability",
+                       "fully booked", "sold out", "no appointments", "unavailable"]:
+            if phrase in s.lower():
+                print(f"    Contains phrase: '{phrase}'")
+        print(f"    First 1500 chars: {s[:1500]}")
 
 
 def main() -> None:
-    print(f"[{datetime.now().isoformat()}] Acuity discovery run")
-    print(f"BOOKING_URL: {BOOKING_URL}\n")
+    print(f"[{datetime.now().isoformat()}] Acuity discovery v2")
 
-    # ── 1. Fetch the booking page itself ──
-    print("### STEP 1: main booking page ###")
+    # ── 1. Full page dump ──
+    print("\n### STEP 1: full booking page ###")
     html = ""
     try:
         status, html = fetch(BOOKING_URL, HEADERS)
-        print(f"  Status: {status}")
-        print(f"  Length: {len(html)}")
-        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
-        print(f"  Title: {m.group(1).strip() if m else '(none)'}")
-    except HTTPError as e:
-        print(f"  HTTPError {e.code} {e.reason}")
-        try:
-            html = e.read().decode("utf-8", errors="replace")
-            print(f"  Body (first 1000): {html[:1000]}")
-        except Exception:
-            pass
+        print(f"  Status: {status}, length: {len(html)}")
     except Exception as e:
         print(f"  Error: {e}")
 
     if html:
-        # Owner ID is needed for the classic schedule.php endpoints
-        for pat in [r'owner["\']?\s*[:=]\s*["\']?(\d{4,})',
-                    r'data-owner=["\'](\d{4,})["\']',
-                    r'ownerId["\']?\s*[:=]\s*["\']?(\d{4,})']:
-            found = re.findall(pat, html, re.I)
-            if found:
-                print(f"  Owner ID candidates via /{pat}/: {sorted(set(found))[:5]}")
+        print("\n  ── FULL PAGE HTML ──")
+        chunk = 3000
+        for i in range(0, len(html), chunk):
+            print(f"  [chars {i}-{i+chunk}]\n{html[i:i+chunk]}")
 
-        print("\n  Availability-related keywords present in page:")
-        for hint in AVAILABILITY_HINTS:
-            n = len(re.findall(re.escape(hint), html, re.I))
-            if n:
-                print(f"    {hint}: {n}")
+        # Pull out the appointment type entry matching our URL
+        for m in re.finditer(r'\{"id":' + APPOINTMENT_TYPE_ID + r'.{0,700}', html):
+            print(f"\n  APPOINTMENT TYPE {APPOINTMENT_TYPE_ID} entry: {m.group(0)}")
 
-        # Any inline JSON blobs
-        for pat, label in [
-            (r'<script[^>]*type=["\']application/json["\'][^>]*>(.*?)</script>', "application/json"),
-            (r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\})\s*;', "__INITIAL_STATE__"),
-            (r'window\.acuity\w*\s*=\s*(\{.*?\})\s*;', "window.acuity*"),
-        ]:
-            for mm in re.finditer(pat, html, re.I | re.S):
-                print(f"\n  JSON blob [{label}] (first 1200): {mm.group(1)[:1200]}")
-
-        # Look for API paths referenced in the page
-        api_paths = sorted(set(re.findall(r'["\'](/api/[A-Za-z0-9/_\-{}.]+)["\']', html)))
-        print(f"\n  /api/ paths referenced in page ({len(api_paths)}):")
-        for p in api_paths[:40]:
-            print(f"    {p}")
-
-        # Telltale 'no availability' phrasing
-        for phrase in ["no times", "not available", "no availability",
-                       "fully booked", "sold out", "no appointments"]:
-            if phrase in html.lower():
-                print(f"  NOTE: page contains phrase '{phrase}'")
-
-        mid = len(html) // 2
-        print(f"\n  Raw HTML sample (middle 1200 chars):\n{html[mid:mid+1200]}")
-
-    # ── 2. Probe candidate availability endpoints ──
-    print("\n### STEP 2: probing candidate availability endpoints ###")
+    # ── 2. Probe classic endpoints with the REAL owner id ──
+    print("\n\n### STEP 2: classic schedule.php probes (owner=%s) ###" % OWNER_ID)
     for month in MONTHS:
         probe(
-            f"scheduling-page availability/dates {month}",
-            f"https://app.acuityscheduling.com/api/scheduling-page/{SLUG}"
-            f"/availability/dates?appointmentTypeId={APPOINTMENT_TYPE_ID}"
-            f"&calendarId={CALENDAR_ID}&month={month}",
-            JSON_HEADERS,
+            f"showCalendar {month}",
+            f"https://app.acuityscheduling.com/schedule.php?action=showCalendar"
+            f"&fulldate=1&owner={OWNER_ID}&type={APPOINTMENT_TYPE_ID}"
+            f"&calendarID={CALENDAR_ID}&month={month}",
         )
         probe(
-            f"classic showCalendar {month}",
-            f"https://app.acuityscheduling.com/schedule.php?action=showCalendar"
-            f"&fulldate=1&owner={SLUG}&type={APPOINTMENT_TYPE_ID}"
+            f"availableDates {month}",
+            f"https://app.acuityscheduling.com/schedule.php?action=availableDates"
+            f"&owner={OWNER_ID}&type={APPOINTMENT_TYPE_ID}"
             f"&calendarID={CALENDAR_ID}&month={month}",
-            JSON_HEADERS,
         )
 
     probe(
-        "appointment-types",
-        f"https://app.acuityscheduling.com/api/scheduling-page/{SLUG}/appointment-types",
-        JSON_HEADERS,
+        "showSelect (type chooser)",
+        f"https://app.acuityscheduling.com/schedule.php?action=showSelect&owner={OWNER_ID}",
     )
     probe(
-        "scheduling-page root",
-        f"https://app.acuityscheduling.com/api/scheduling-page/{SLUG}",
-        JSON_HEADERS,
+        "plain schedule.php owner page",
+        f"https://app.acuityscheduling.com/schedule.php?owner={OWNER_ID}",
     )
 
 
