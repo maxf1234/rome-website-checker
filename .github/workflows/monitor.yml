@@ -1,24 +1,21 @@
 name: Acuity Availability Monitor
 
 on:
-  # GitHub's cron floor is ~5 min, so each run stays alive and polls
-  # internally every 60s. A new run every 30 min takes over from the last.
+  # Every 5 minutes — GitHub's shortest supported cron interval.
   schedule:
-    - cron: '0,30 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
   repository_dispatch:
     types: [run-monitor]
 
-# A newly started run replaces the previous one, so a hung or stalled run
-# can never block coverage.
 concurrency:
   group: availability-monitor
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 40
+    timeout-minutes: 5
 
     permissions:
       contents: write
@@ -34,11 +31,9 @@ jobs:
 
       - name: Run monitor
         env:
-          EMAIL_SENDER:       ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD:     ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_RECIPIENT:    ${{ secrets.EMAIL_RECIPIENT }}
-          CHECK_INTERVAL_SEC: '60'
-          RUN_DURATION_SEC:   '1920'   # 32 min — overlaps the next run slightly
+          EMAIL_SENDER:     ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD:   ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECIPIENT:  ${{ secrets.EMAIL_RECIPIENT }}
         run: python monitor.py
 
       - name: Commit updated state
